@@ -278,6 +278,10 @@ from robocasa.environments.kitchen.single_stage.kitchen_pnp import (
     PnPMicrowaveToCounter,
     PnPSinkToCounter,
 )
+from robocasa.environments.kitchen.single_stage.kitchen_minimal import (
+    CountertopMugPickup,
+)
+
 from robocasa.environments.kitchen.single_stage.kitchen_sink import (
     TurnOffSinkFaucet,
     TurnOnSinkFaucet,
