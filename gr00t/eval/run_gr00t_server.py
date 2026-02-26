@@ -49,6 +49,9 @@ class ServerConfig:
     use_sim_policy_wrapper: bool = False
     """Whether to use the sim policy wrapper"""
 
+    rl_residual_checkpoint: str | None = None
+    """Optional PPO residual adapter checkpoint to apply on top of the sim policy wrapper."""
+
 
 def main(config: ServerConfig):
     print("Starting GR00T inference server...")
@@ -57,10 +60,24 @@ def main(config: ServerConfig):
     print(f"  Device: {config.device}")
     print(f"  Host: {config.host}")
     print(f"  Port: {config.port}")
+    print(f"  RL residual checkpoint: {config.rl_residual_checkpoint}")
 
     # check if the model path exists
-    if config.model_path.startswith("/") and not os.path.exists(config.model_path):
+    if (
+        config.model_path is not None
+        and config.model_path.startswith("/")
+        and not os.path.exists(config.model_path)
+    ):
         raise FileNotFoundError(f"Model path {config.model_path} does not exist")
+
+    if (
+        config.rl_residual_checkpoint is not None
+        and config.rl_residual_checkpoint.startswith("/")
+        and not os.path.exists(config.rl_residual_checkpoint)
+    ):
+        raise FileNotFoundError(
+            f"RL residual checkpoint {config.rl_residual_checkpoint} does not exist"
+        )
 
     # Create and start the server
     if config.model_path is not None:
@@ -92,6 +109,20 @@ def main(config: ServerConfig):
         from gr00t.policy.gr00t_policy import Gr00tSimPolicyWrapper
 
         policy = Gr00tSimPolicyWrapper(policy)
+
+    if config.rl_residual_checkpoint is not None:
+        if not config.use_sim_policy_wrapper:
+            raise ValueError(
+                "--rl-residual-checkpoint requires --use-sim-policy-wrapper because the residual adapter expects the sim observation/action format"
+            )
+        from gr00t.policy.rl_residual_policy import RLPPOResidualSimPolicyWrapper
+
+        policy = RLPPOResidualSimPolicyWrapper(
+            policy,
+            checkpoint_path=config.rl_residual_checkpoint,
+            device=config.device,
+            strict=config.strict,
+        )
 
     server = PolicyServer(
         policy=policy,
