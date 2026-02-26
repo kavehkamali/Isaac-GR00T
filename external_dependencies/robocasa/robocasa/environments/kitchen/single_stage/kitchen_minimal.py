@@ -7,10 +7,12 @@ class CountertopMugPickup(Kitchen):
     """Minimal pickup task: a single mug on a countertop in a full kitchen scene."""
 
     LIFT_SUCCESS_DELTA_Z = 0.08
+    LIFT_HOLD_STEPS = 5
 
     def __init__(self, *args, **kwargs):
         kwargs.setdefault("use_distractors", False)
         self._obj_init_z = None
+        self._lift_hold_count = 0
         super().__init__(*args, **kwargs)
 
     def _setup_kitchen_references(self):
@@ -46,12 +48,20 @@ class CountertopMugPickup(Kitchen):
     def _reset_internal(self):
         super()._reset_internal()
         self._obj_init_z = float(self.sim.data.body_xpos[self.obj_body_id["obj"]][2])
+        self._lift_hold_count = 0
 
     def _check_success(self):
-        """Succeed when the mug is clearly lifted off the countertop."""
+        """Succeed only after the mug stays lifted off the counter for several steps."""
         if self._obj_init_z is None:
             return False
+
         obj_z = float(self.sim.data.body_xpos[self.obj_body_id["obj"]][2])
         lifted = obj_z > (self._obj_init_z + self.LIFT_SUCCESS_DELTA_Z)
         on_counter = OU.check_obj_fixture_contact(self, "obj", self.counter)
-        return lifted and not on_counter
+
+        if lifted and not on_counter:
+            self._lift_hold_count += 1
+        else:
+            self._lift_hold_count = 0
+
+        return self._lift_hold_count >= self.LIFT_HOLD_STEPS
