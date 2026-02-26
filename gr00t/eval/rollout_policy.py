@@ -239,6 +239,7 @@ def run_rollout_gymnasium_policy(
     wrapper_configs: WrapperConfigs,
     n_episodes: int = 10,
     n_envs: int = 1,
+    seed: int | None = None,
 ) -> Any:
     """Run policy rollouts in parallel environments.
 
@@ -286,7 +287,7 @@ def run_rollout_gymnasium_policy(
     episode_infos = defaultdict(list)
 
     # Initial reset
-    observations, _ = env.reset()
+    observations, _ = env.reset(seed=seed)
     policy.reset()
     i = 0
 
@@ -416,6 +417,7 @@ def run_gr00t_sim_policy(
     policy_client_port: int | None = None,
     n_envs: int = 8,
     n_action_steps: int = 8,
+    seed: int | None = None,
 ):
     embodiment_tag = get_embodiment_tag_from_env_name(env_name)
 
@@ -450,6 +452,7 @@ def run_gr00t_sim_policy(
         wrapper_configs=wrapper_configs,
         n_episodes=n_episodes,
         n_envs=n_envs,
+        seed=seed,
     )
     print("Video saved to: ", wrapper_configs.video.video_dir)
     return results
@@ -473,6 +476,7 @@ if __name__ == "__main__":
     )
     parser.add_argument("--n_envs", type=int, default=8)
     parser.add_argument("--n_action_steps", type=int, default=8)
+    parser.add_argument("--seed", type=int, default=None)
 
     args = parser.parse_args()
 
@@ -495,6 +499,7 @@ if __name__ == "__main__":
         policy_client_port=args.policy_client_port,
         n_envs=args.n_envs,
         n_action_steps=args.n_action_steps,
+        seed=args.seed,
     )
     print("results: ", results)
     print("success rate: ", np.mean(results[1]))
