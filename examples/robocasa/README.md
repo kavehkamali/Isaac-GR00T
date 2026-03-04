@@ -66,3 +66,22 @@ gr00t/eval/sim/robocasa/robocasa_uv/.venv/bin/python gr00t/eval/rollout_policy.p
     --n_action_steps 8 \
     --n_envs 5
 ```
+
+# Convert RoboCasa-VR demos to GR00T LeRobot format
+
+Use this converter when your trajectories were collected in the RoboCasa-VR repository (`demo.hdf5` files).
+
+```bash
+python scripts/robocasa/convert_robocasa_vr_to_lerobot.py \
+    --input /path/to/robocasa_vr_data \
+    --output /path/to/robocasa_vr_lerobot \
+    --robot-type PandaOmron \
+    --fallback-task "pick up the mug" \
+    --overwrite
+```
+
+Notes:
+- `--input` can be a single `demo.hdf5` or a directory containing many `demo.hdf5` files.
+- Output follows GR00T-flavored LeRobot v2 structure (`meta/` + chunked parquet in `data/`).
+- Runtime dependencies: `h5py`, `pandas`, `pyarrow`, `numpy`.
+
