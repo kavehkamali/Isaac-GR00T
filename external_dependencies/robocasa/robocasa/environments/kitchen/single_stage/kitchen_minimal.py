@@ -8,9 +8,26 @@ class CountertopMugPickup(Kitchen):
 
     LIFT_SUCCESS_DELTA_Z = 0.08
     LIFT_HOLD_STEPS = 5
+    DEFAULT_FIXED_LAYOUT_ID = 0
+    DEFAULT_FIXED_STYLE_ID = 0
+    DEFAULT_FIXED_COUNTER_NAME = "counter_right_main_group"
+    DEFAULT_COUNTER_SIZE = (0.35, 0.35)
 
     def __init__(self, *args, **kwargs):
         kwargs.setdefault("use_distractors", False)
+        self.randomize_scene = bool(kwargs.pop("randomize_scene", False))
+        self.randomize_robot_pose = bool(kwargs.pop("randomize_robot_pose", False))
+        self.robot_pose_jitter_xy = float(max(0.0, kwargs.pop("robot_pose_jitter_xy", 0.0)))
+        self.robot_pose_outward_only = bool(kwargs.pop("robot_pose_outward_only", True))
+        self.fixed_layout_id = int(kwargs.pop("fixed_layout_id", self.DEFAULT_FIXED_LAYOUT_ID))
+        self.fixed_style_id = int(kwargs.pop("fixed_style_id", self.DEFAULT_FIXED_STYLE_ID))
+        self.fixed_counter_name = str(kwargs.pop("fixed_counter_name", self.DEFAULT_FIXED_COUNTER_NAME))
+
+        # Keep the scene deterministic unless scene randomization is explicitly enabled.
+        if not self.randomize_scene:
+            kwargs["layout_ids"] = [self.fixed_layout_id]
+            kwargs["style_ids"] = [self.fixed_style_id]
+
         self._obj_init_z = None
         self._lift_hold_count = 0
         super().__init__(*args, **kwargs)
@@ -18,9 +35,20 @@ class CountertopMugPickup(Kitchen):
     def _setup_kitchen_references(self):
         """Select a valid countertop region and place the robot near it."""
         super()._setup_kitchen_references()
-        self.counter = self.register_fixture_ref(
-            "counter", dict(id=FixtureType.COUNTER, size=(0.35, 0.35))
-        )
+
+        if self.randomize_scene:
+            counter_kwargs = {"id": FixtureType.COUNTER, "size": self.DEFAULT_COUNTER_SIZE}
+        else:
+            counter_id = (
+                self.fixed_counter_name
+                if self.fixed_counter_name in self.fixtures
+                else FixtureType.COUNTER
+            )
+            counter_kwargs = {"id": counter_id}
+            if counter_id == FixtureType.COUNTER:
+                counter_kwargs["size"] = self.DEFAULT_COUNTER_SIZE
+
+        self.counter = self.register_fixture_ref("counter", counter_kwargs)
         self.init_robot_base_pos = self.counter
 
     def get_ep_meta(self):
@@ -38,12 +66,38 @@ class CountertopMugPickup(Kitchen):
                 graspable=True,
                 placement=dict(
                     fixture=self.counter,
-                    size=(0.35, 0.35),
+                    size=self.DEFAULT_COUNTER_SIZE,
                     pos=(0.0, 0.0),
-                    rotation=(0.0, 2 * np.pi),
+                    rotation=(0.0, 0.0),
                 ),
             )
         ]
+
+    def compute_robot_base_placement_pose(self, ref_fixture, offset=None):
+        if self.randomize_robot_pose and self.robot_pose_jitter_xy > 0.0:
+            x_jitter = float(
+                self.rng.uniform(
+                    low=-self.robot_pose_jitter_xy,
+                    high=self.robot_pose_jitter_xy,
+                )
+            )
+            if self.robot_pose_outward_only:
+                # Keep y-offset outward from the counter to avoid invalid poses inside cabinetry.
+                y_jitter = float(self.rng.uniform(low=-self.robot_pose_jitter_xy, high=0.0))
+            else:
+                y_jitter = float(
+                    self.rng.uniform(
+                        low=-self.robot_pose_jitter_xy,
+                        high=self.robot_pose_jitter_xy,
+                    )
+                )
+            if offset is None:
+                offset = [0.0, 0.0]
+            else:
+                offset = list(offset)
+            offset[0] += x_jitter
+            offset[1] += y_jitter
+        return super().compute_robot_base_placement_pose(ref_fixture=ref_fixture, offset=offset)
 
     def _reset_internal(self):
         super()._reset_internal()
