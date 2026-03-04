@@ -85,3 +85,35 @@ Notes:
 - Output follows GR00T-flavored LeRobot v2 structure (`meta/` + chunked parquet in `data/`).
 - Runtime dependencies: `h5py`, `pandas`, `pyarrow`, `numpy`.
 
+
+# Fine-tune on RoboCasa-VR CountertopMugPickup
+
+Run in this exact order:
+
+1. Convert RoboCasa-VR demos:
+```bash
+python scripts/robocasa/convert_robocasa_vr_to_lerobot.py \
+    --input /path/to/robocasa_vr_data \
+    --output /path/to/robocasa_vr_lerobot \
+    --robot-type PandaOmron \
+    --fallback-task "pick up the mug" \
+    --overwrite
+```
+
+2. Launch fine-tuning from the converted dataset:
+```bash
+bash examples/robocasa/finetune_countertop_mug_vr.sh \
+    /path/to/robocasa_vr_lerobot \
+    /tmp/robocasa_vr_countertop_mug_finetune
+```
+
+Optional env overrides for step 2:
+- `NUM_GPUS` (default `1`)
+- `BASE_MODEL_PATH` (default `nvidia/GR00T-N1.6-3B`)
+- `MAX_STEPS` (default `10000`)
+- `GLOBAL_BATCH_SIZE` (default `64`)
+- `USE_WANDB=1` to enable wandb logging
+
+Notes:
+- This fine-tuning path uses `NEW_EMBODIMENT` with `sim_state` and `sim_action` from the RoboCasa-VR converter.
+- RoboCasa-VR demos are commonly state/action only; the processor now supports that path without requiring recorded videos.

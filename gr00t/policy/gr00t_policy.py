@@ -110,14 +110,23 @@ class Gr00tPolicy(BasePolicy):
         Returns:
             List of B observations, each with the batch dimension removed
         """
+        video_config = self.modality_configs.get("video")
+        video_keys = video_config.modality_keys if video_config is not None else []
+
+        batch_size = None
+        if len(video_keys) > 0 and "video" in value and video_keys[0] in value["video"]:
+            batch_size = value["video"][video_keys[0]].shape[0]
+
+        if batch_size is None:
+            first_state_key = self.modality_configs["state"].modality_keys[0]
+            batch_size = value["state"][first_state_key].shape[0]
+
         unbatched_obs = []
-        # Infer batch size from the first video key
-        batch_size = value["video"][list(value["video"].keys())[0]].shape[0]
 
         # Split each modality along the batch dimension
         for i in range(batch_size):
             unbatched_value = {
-                "video": {k: v[i] for k, v in value["video"].items()},
+                "video": {k: v[i] for k, v in value.get("video", {}).items()},
                 "state": {k: v[i] for k, v in value["state"].items()},
                 "language": {k: v[i] for k, v in value["language"].items()},
             }
@@ -167,8 +176,15 @@ class Gr00tPolicy(BasePolicy):
         Raises:
             AssertionError: If any validation check fails
         """
+        video_config = self.modality_configs.get("video")
+        video_keys = video_config.modality_keys if video_config is not None else []
+
+        required_modalities = ["state", "language"]
+        if len(video_keys) > 0:
+            required_modalities.insert(0, "video")
+
         # Check that observation contains all required top-level modality keys
-        for modality in ["video", "state", "language"]:
+        for modality in required_modalities:
             assert modality in observation, f"Observation must contain a '{modality}' key"
             assert isinstance(observation[modality], dict), (
                 f"Observation '{modality}' must be a dictionary. Got {type(observation[modality])}: {observation[modality]}"
@@ -179,7 +195,7 @@ class Gr00tPolicy(BasePolicy):
 
         # ===== VIDEO VALIDATION =====
         # Validate each video stream defined in the modality config
-        for video_key in self.modality_configs["video"].modality_keys:
+        for video_key in video_keys:
             # Set or verify batch size consistency across all video keys
             if bs == -1:
                 bs = len(observation["video"][video_key])
@@ -211,8 +227,8 @@ class Gr00tPolicy(BasePolicy):
             )
 
             # Verify temporal dimension matches the expected horizon from config
-            assert batched_video.shape[1] == len(self.modality_configs["video"].delta_indices), (
-                f"Video key '{video_key}'s horizon must be {len(self.modality_configs['video'].delta_indices)}. Got {batched_video.shape[1]}"
+            assert batched_video.shape[1] == len(video_config.delta_indices), (
+                f"Video key '{video_key}'s horizon must be {len(video_config.delta_indices)}. Got {batched_video.shape[1]}"
             )
 
             # Verify channel dimension is 3 (RGB images)
@@ -470,8 +486,11 @@ class Gr00tSimPolicyWrapper(PolicyWrapper):
         modality_configs = self.get_modality_config()
 
         # ===== VIDEO VALIDATION =====
+        video_config = modality_configs.get("video")
+        video_keys = video_config.modality_keys if video_config is not None else []
+
         # Check video modalities with flat key format: 'video.camera_name'
-        for video_key in modality_configs["video"].modality_keys:
+        for video_key in video_keys:
             # Construct flat key expected in Gr00t sim environment
             parsed_key = f"video.{video_key}"
             assert parsed_key in observation, f"Video key '{parsed_key}' must be in observation"
@@ -494,8 +513,8 @@ class Gr00tSimPolicyWrapper(PolicyWrapper):
             )
 
             # Verify temporal dimension matches the expected horizon from config
-            assert batched_video.shape[1] == len(modality_configs["video"].delta_indices), (
-                f"Video key '{video_key}'s horizon must be {len(modality_configs['video'].delta_indices)}. Got {batched_video.shape[1]}"
+            assert batched_video.shape[1] == len(video_config.delta_indices), (
+                f"Video key '{video_key}'s horizon must be {len(video_config.delta_indices)}. Got {batched_video.shape[1]}"
             )
 
             # Verify channel dimension is 3 (RGB images)
@@ -583,8 +602,12 @@ class Gr00tSimPolicyWrapper(PolicyWrapper):
             Tuple of (flat_actions_dict, info_dict)
         """
         # Transform flat observation format to nested format expected by Gr00tPolicy
-        new_obs = {}
-        for modality in ["video", "state", "language"]:
+        new_obs = {"video": {}, "state": {}, "language": {}}
+        modalities = ["state", "language"]
+        video_config = self.policy.modality_configs.get("video")
+        if video_config is not None and len(video_config.modality_keys) > 0:
+            modalities.insert(0, "video")
+        for modality in modalities:
             new_obs[modality] = {}
             for key in self.policy.modality_configs[modality].modality_keys:
                 if modality == "language":

@@ -361,7 +361,8 @@ class Gr00tN1d6Processor(BaseProcessor):
             image_transform = self.train_image_transform
         else:
             image_transform = self.eval_image_transform
-        image_keys = self.modality_configs[embodiment_tag.value]["video"].modality_keys
+        video_config = self.modality_configs[embodiment_tag.value].get("video")
+        image_keys = video_config.modality_keys if video_config is not None else []
 
         if self.formalize_language:
             language = content.text.lower()
@@ -369,12 +370,15 @@ class Gr00tN1d6Processor(BaseProcessor):
         else:
             language = content.text
 
-        vlm_inputs = self._get_vlm_inputs(
-            image_keys=image_keys,
-            images=content.images,
-            image_transform=image_transform,
-            language=language,
-        )
+        if len(image_keys) > 0:
+            vlm_inputs = self._get_vlm_inputs(
+                image_keys=image_keys,
+                images=content.images,
+                image_transform=image_transform,
+                language=language,
+            )
+        else:
+            vlm_inputs = self._get_placeholder_vlm_inputs(language=language)
 
         transformed_inputs = {
             "state": normalized_states.to(torch.get_default_dtype()),
@@ -430,6 +434,17 @@ class Gr00tN1d6Processor(BaseProcessor):
 
         vlm_inputs = self._apply_vlm_processing(stacked_images, language)
         return vlm_inputs
+
+    def _get_placeholder_vlm_inputs(self, language: str) -> BatchFeature:
+        if self.image_target_size is not None and len(self.image_target_size) >= 2:
+            height = int(self.image_target_size[0])
+            width = int(self.image_target_size[1])
+        else:
+            height = 224
+            width = 224
+
+        placeholder_images = np.zeros((1, 3, height, width), dtype=np.uint8)
+        return self._apply_vlm_processing(placeholder_images, language)
 
     def save_pretrained(self, save_directory: str | Path) -> list[Path]:
         # dump modality configs to dict using the recursive function
