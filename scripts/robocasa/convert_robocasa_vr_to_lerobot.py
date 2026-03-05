@@ -15,6 +15,9 @@ Output format:
 Notes:
 - This converter writes state-only data (no videos).
 - By default, modality keys are single blocks: "sim_state" and "sim_action".
+- By default, states are full MuJoCo simulator states from DataCollectionWrapper.
+  Use --state-view robot to keep only robot-related joint state (time + qpos + qvel
+  for robot / gripper / mobilebase joints), which removes scene fixture joints.
 - If mixed state/action dimensions are present in input files, the converter
   automatically keeps the most common (state_dim, action_dim) pair unless
   --state-dim and --action-dim are explicitly provided.
@@ -28,8 +31,10 @@ from collections import Counter
 from dataclasses import dataclass
 import json
 from pathlib import Path
+import re
 import shutil
 from typing import Any
+import xml.etree.ElementTree as ET
 
 import numpy as np
 
@@ -41,6 +46,7 @@ class EpisodeRecord:
     env_name: str
     states: np.ndarray
     actions: np.ndarray
+    model_xml: str | None = None
 
 
 def _load_runtime_deps():
@@ -140,6 +146,8 @@ def _read_episodes_from_hdf5(
                 states = states[:length]
                 actions = actions[:length]
                 task_text = _extract_task_text(demo_grp.attrs.get("ep_meta"), fallback_task)
+                model_xml_attr = demo_grp.attrs.get("model_file")
+                model_xml = _to_text(model_xml_attr) if model_xml_attr is not None else None
 
                 episodes.append(
                     EpisodeRecord(
@@ -148,6 +156,7 @@ def _read_episodes_from_hdf5(
                         env_name=env_name,
                         states=states,
                         actions=actions,
+                        model_xml=model_xml,
                     )
                 )
                 episode_idx += 1
@@ -184,6 +193,107 @@ def _choose_target_dims(
     # Default: pick the most common dimensions.
     target = sorted(dim_counts.items(), key=lambda kv: (-kv[1], kv[0]))[0][0]
     return target, dim_counts
+
+
+_ROBOT_JOINT_RE = re.compile(r"^(robot\d+_|gripper\d+_|mobilebase\d+_)")
+
+
+def _joint_sizes_from_type(joint_type: str) -> tuple[int, int]:
+    jt = (joint_type or "hinge").lower()
+    if jt in ("hinge", "slide"):
+        return 1, 1
+    if jt == "ball":
+        return 4, 3
+    if jt == "free":
+        return 7, 6
+    # fallback for custom / unknown joint types
+    return 1, 1
+
+
+def _extract_robot_state_from_sim_state(states: np.ndarray, model_xml: str, episode_index: int) -> np.ndarray:
+    try:
+        root = ET.fromstring(model_xml)
+    except Exception as exc:
+        raise RuntimeError(
+            f"Episode {episode_index}: could not parse model_file XML for robot-state extraction."
+        ) from exc
+
+    joints = root.findall(".//joint")
+    if not joints:
+        raise RuntimeError(f"Episode {episode_index}: no joints found in model_file XML.")
+
+    qpos_cursor = 0
+    qvel_cursor = 0
+    robot_qpos_idx: list[int] = []
+    robot_qvel_idx: list[int] = []
+
+    for joint in joints:
+        name = joint.attrib.get("name", "")
+        nq, nv = _joint_sizes_from_type(joint.attrib.get("type", "hinge"))
+        if _ROBOT_JOINT_RE.match(name):
+            robot_qpos_idx.extend(range(qpos_cursor, qpos_cursor + nq))
+            robot_qvel_idx.extend(range(qvel_cursor, qvel_cursor + nv))
+        qpos_cursor += nq
+        qvel_cursor += nv
+
+    if not robot_qpos_idx or not robot_qvel_idx:
+        raise RuntimeError(
+            f"Episode {episode_index}: no robot joints matched in XML. "
+            "Expected names starting with robot*, gripper*, or mobilebase*."
+        )
+
+    # DataCollectionWrapper stores sim.get_state().flatten(), which starts with time,
+    # then qpos and qvel (and may include additional tail data).
+    required = 1 + qpos_cursor + qvel_cursor
+    if states.shape[1] < required:
+        raise RuntimeError(
+            f"Episode {episode_index}: state vector too short ({states.shape[1]}) "
+            f"for parsed model dimensions (minimum {required})."
+        )
+
+    time_col = states[:, :1]
+    qpos = states[:, 1 : 1 + qpos_cursor]
+    qvel = states[:, 1 + qpos_cursor : 1 + qpos_cursor + qvel_cursor]
+
+    robot_state = np.concatenate(
+        [
+            time_col,
+            qpos[:, robot_qpos_idx],
+            qvel[:, robot_qvel_idx],
+        ],
+        axis=1,
+    )
+    return robot_state.astype(np.float32)
+
+
+def _project_state_view(episodes: list[EpisodeRecord], state_view: str) -> list[EpisodeRecord]:
+    if state_view == "full":
+        return episodes
+    if state_view != "robot":
+        raise ValueError(f"Unsupported state view: {state_view}")
+
+    projected: list[EpisodeRecord] = []
+    for ep in episodes:
+        if not ep.model_xml:
+            raise RuntimeError(
+                f"Episode {ep.episode_index}: model_file missing, cannot build robot-only state."
+            )
+        projected_states = _extract_robot_state_from_sim_state(
+            states=ep.states,
+            model_xml=ep.model_xml,
+            episode_index=ep.episode_index,
+        )
+        projected.append(
+            EpisodeRecord(
+                episode_index=ep.episode_index,
+                task_text=ep.task_text,
+                env_name=ep.env_name,
+                states=projected_states,
+                actions=ep.actions,
+                model_xml=ep.model_xml,
+            )
+        )
+    return projected
 
 
 def _compute_stats(arr: np.ndarray) -> dict[str, list[float]]:
@@ -231,6 +341,7 @@ def convert(args: argparse.Namespace) -> None:
         fallback_task=args.fallback_task,
         h5py=h5py,
     )
+    raw_episodes = _project_state_view(raw_episodes, state_view=args.state_view)
 
     target_dims, dim_counts = _choose_target_dims(
         raw_episodes,
@@ -265,6 +376,7 @@ def convert(args: argparse.Namespace) -> None:
             env_name=ep.env_name,
             states=ep.states,
             actions=ep.actions,
+            model_xml=ep.model_xml,
         )
         for i, ep in enumerate(filtered_episodes)
     ]
@@ -473,6 +585,15 @@ def build_argparser() -> argparse.ArgumentParser:
         "--valid-label",
         default="valid",
         help="Label text used for annotation.human.validity",
+    )
+    parser.add_argument(
+        "--state-view",
+        choices=["full", "robot"],
+        default="full",
+        help=(
+            "State representation: 'full' keeps raw MuJoCo sim state; "
+            "'robot' keeps only time + robot/gripper/mobilebase qpos+qvel."
+        ),
     )
     parser.add_argument(
         "--state-dim",
