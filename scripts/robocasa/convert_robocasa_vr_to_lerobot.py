@@ -1,42 +1,59 @@
 #!/usr/bin/env python3
-"""Convert RoboCasa-VR demo.hdf5 files to GR00T-flavored LeRobot v2 format.
+"""Convert RoboCasa-VR demo.hdf5 files to GR00T-compatible LeRobot v2 data.
 
-Input format expected from RoboCasa-VR collect_demos:
-- one or more demo.hdf5 files
-- each file contains group: data/demo_<N> with datasets:
-  - states: (T, state_dim)
-  - actions: (T, action_dim)
-- optional group attrs / demo attrs with env metadata and ep_meta JSON
+This converter targets the PandaOmron RoboCasa schema expected by GR00T's
+`robocasa_panda_omron` modality:
 
-Output format:
-- <output>/meta/{info.json,episodes.jsonl,tasks.jsonl,modality.json,stats.json,relative_stats.json}
-- <output>/data/chunk-XXX/episode_XXXXXX.parquet
+State order (16):
+- end_effector_position_relative (3)
+- end_effector_rotation_relative (4)   # quaternion xyzw
+- gripper_qpos (2)
+- base_position (3)
+- base_rotation (4)                    # quaternion xyzw
 
-Notes:
-- This converter writes state-only data (no videos).
-- By default, modality keys are single blocks: "sim_state" and "sim_action".
-- By default, states are full MuJoCo simulator states from DataCollectionWrapper.
-  Use --state-view robot to keep only robot-related joint state (time + qpos + qvel
-  for robot / gripper / mobilebase joints), which removes scene fixture joints.
-- If mixed state/action dimensions are present in input files, the converter
-  automatically keeps the most common (state_dim, action_dim) pair unless
-  --state-dim and --action-dim are explicitly provided.
-- Requires: h5py, pandas, pyarrow, numpy
+Action order (12):
+- end_effector_position (3)
+- end_effector_rotation (3)
+- gripper_close (1)                    # 0/1
+- base_motion (4)
+- control_mode (1)                     # 0/1
 """
 
 from __future__ import annotations
 
 import argparse
-from collections import Counter
+import copy
 from dataclasses import dataclass
 import json
 from pathlib import Path
-import re
 import shutil
 from typing import Any
 import xml.etree.ElementTree as ET
 
 import numpy as np
+
+
+STATE_LAYOUT: list[tuple[str, int]] = [
+    ("end_effector_position_relative", 3),
+    ("end_effector_rotation_relative", 4),
+    ("gripper_qpos", 2),
+    ("base_position", 3),
+    ("base_rotation", 4),
+]
+
+ACTION_LAYOUT: list[tuple[str, int]] = [
+    ("end_effector_position", 3),
+    ("end_effector_rotation", 3),
+    ("gripper_close", 1),
+    ("base_motion", 4),
+    ("control_mode", 1),
+]
+
+STATE_DIM = sum(width for _, width in STATE_LAYOUT)
+ACTION_DIM = sum(width for _, width in ACTION_LAYOUT)
+
+_ASSET_SEARCH_ROOTS: list[Path] | None = None
+_ASSET_PATH_CACHE: dict[str, Path | None] = {}
 
 
 @dataclass
@@ -47,6 +64,18 @@ class EpisodeRecord:
     states: np.ndarray
     actions: np.ndarray
     model_xml: str | None = None
+
+
+@dataclass
+class EpisodeProjection:
+    model: Any
+    data: Any
+    qpos_count: int
+    qvel_count: int
+    gripper_qpos_idx: list[int]
+    base_site_id: int
+    eef_site_id: int
+    eef_body_id: int
 
 
 def _load_runtime_deps():
@@ -62,7 +91,12 @@ def _load_runtime_deps():
             "Missing dependency 'pandas' (and parquet backend). Install with: pip install pandas pyarrow"
         ) from exc
 
-    return h5py, pd
+    try:
+        import mujoco  # type: ignore
+    except Exception as exc:  # pragma: no cover - import guard
+        raise RuntimeError("Missing dependency 'mujoco'. Install with: pip install mujoco") from exc
+
+    return h5py, pd, mujoco
 
 
 def _to_text(value: Any) -> str:
@@ -167,146 +201,18 @@ def _read_episodes_from_hdf5(
     return episodes
 
 
-def _choose_target_dims(
-    episodes: list[EpisodeRecord],
-    state_dim_override: int | None,
-    action_dim_override: int | None,
-) -> tuple[tuple[int, int], Counter[tuple[int, int]]]:
-    dim_counts: Counter[tuple[int, int]] = Counter(
-        (int(ep.states.shape[1]), int(ep.actions.shape[1])) for ep in episodes
-    )
-
-    if (state_dim_override is None) != (action_dim_override is None):
-        raise ValueError("Use --state-dim and --action-dim together, or omit both.")
-
-    if state_dim_override is not None and action_dim_override is not None:
-        target = (int(state_dim_override), int(action_dim_override))
-        if target not in dim_counts:
-            available = ", ".join(
-                f"({s},{a})x{c}" for (s, a), c in sorted(dim_counts.items(), key=lambda kv: (-kv[1], kv[0]))
-            )
-            raise ValueError(
-                f"Requested dimensions {target} not found in input episodes. Available: {available}"
-            )
-        return target, dim_counts
-
-    # Default: pick the most common dimensions.
-    target = sorted(dim_counts.items(), key=lambda kv: (-kv[1], kv[0]))[0][0]
-    return target, dim_counts
-
-
-_ROBOT_JOINT_RE = re.compile(r"^(robot\d+_|gripper\d+_|mobilebase\d+_)")
-
-
-def _joint_sizes_from_type(joint_type: str) -> tuple[int, int]:
-    jt = (joint_type or "hinge").lower()
-    if jt in ("hinge", "slide"):
-        return 1, 1
-    if jt == "ball":
-        return 4, 3
-    if jt == "free":
-        return 7, 6
-    # fallback for custom / unknown joint types
-    return 1, 1
-
-
-def _extract_robot_state_from_sim_state(states: np.ndarray, model_xml: str, episode_index: int) -> np.ndarray:
-    try:
-        root = ET.fromstring(model_xml)
-    except Exception as exc:
-        raise RuntimeError(
-            f"Episode {episode_index}: could not parse model_file XML for robot-state extraction."
-        ) from exc
-
-    joints = root.findall(".//joint")
-    if not joints:
-        raise RuntimeError(f"Episode {episode_index}: no joints found in model_file XML.")
-
-    qpos_cursor = 0
-    qvel_cursor = 0
-    robot_qpos_idx: list[int] = []
-    robot_qvel_idx: list[int] = []
-
-    for joint in joints:
-        name = joint.attrib.get("name", "")
-        nq, nv = _joint_sizes_from_type(joint.attrib.get("type", "hinge"))
-        if _ROBOT_JOINT_RE.match(name):
-            robot_qpos_idx.extend(range(qpos_cursor, qpos_cursor + nq))
-            robot_qvel_idx.extend(range(qvel_cursor, qvel_cursor + nv))
-        qpos_cursor += nq
-        qvel_cursor += nv
-
-    if not robot_qpos_idx or not robot_qvel_idx:
-        raise RuntimeError(
-            f"Episode {episode_index}: no robot joints matched in XML. "
-            "Expected names starting with robot*, gripper*, or mobilebase*."
-        )
-
-    # DataCollectionWrapper stores sim.get_state().flatten(), which starts with time,
-    # then qpos and qvel (and may include additional tail data).
-    required = 1 + qpos_cursor + qvel_cursor
-    if states.shape[1] < required:
-        raise RuntimeError(
-            f"Episode {episode_index}: state vector too short ({states.shape[1]}) "
-            f"for parsed model dimensions (minimum {required})."
-        )
-
-    time_col = states[:, :1]
-    qpos = states[:, 1 : 1 + qpos_cursor]
-    qvel = states[:, 1 + qpos_cursor : 1 + qpos_cursor + qvel_cursor]
-
-    robot_state = np.concatenate(
-        [
-            time_col,
-            qpos[:, robot_qpos_idx],
-            qvel[:, robot_qvel_idx],
-        ],
-        axis=1,
-    )
-    return robot_state.astype(np.float32)
-
-
-def _project_state_view(episodes: list[EpisodeRecord], state_view: str) -> list[EpisodeRecord]:
-    if state_view == "full":
-        return episodes
-    if state_view != "robot":
-        raise ValueError(f"Unsupported state view: {state_view}")
-
-    projected: list[EpisodeRecord] = []
-    for ep in episodes:
-        if not ep.model_xml:
-            raise RuntimeError(
-                f"Episode {ep.episode_index}: model_file missing, cannot build robot-only state."
-            )
-        projected_states = _extract_robot_state_from_sim_state(
-            states=ep.states,
-            model_xml=ep.model_xml,
-            episode_index=ep.episode_index,
-        )
-        projected.append(
-            EpisodeRecord(
-                episode_index=ep.episode_index,
-                task_text=ep.task_text,
-                env_name=ep.env_name,
-                states=projected_states,
-                actions=ep.actions,
-                model_xml=ep.model_xml,
-            )
-        )
-    return projected
-
-
 def _compute_stats(arr: np.ndarray) -> dict[str, list[float]]:
     if arr.ndim != 2:
         raise ValueError(f"Expected 2D array for stats, got shape={arr.shape}")
 
+    arr64 = arr.astype(np.float64)
     return {
-        "mean": np.mean(arr, axis=0).astype(np.float64).tolist(),
-        "std": np.std(arr, axis=0).astype(np.float64).tolist(),
-        "min": np.min(arr, axis=0).astype(np.float64).tolist(),
-        "max": np.max(arr, axis=0).astype(np.float64).tolist(),
-        "q01": np.percentile(arr, 1, axis=0).astype(np.float64).tolist(),
-        "q99": np.percentile(arr, 99, axis=0).astype(np.float64).tolist(),
+        "mean": np.mean(arr64, axis=0).astype(np.float64).tolist(),
+        "std": np.std(arr64, axis=0).astype(np.float64).tolist(),
+        "min": np.min(arr64, axis=0).astype(np.float64).tolist(),
+        "max": np.max(arr64, axis=0).astype(np.float64).tolist(),
+        "q01": np.percentile(arr64, 1, axis=0).astype(np.float64).tolist(),
+        "q99": np.percentile(arr64, 99, axis=0).astype(np.float64).tolist(),
     }
 
 
@@ -322,8 +228,506 @@ def _write_jsonl(path: Path, rows: list[dict[str, Any]]) -> None:
             f.write(json.dumps(row, ensure_ascii=False) + "\n")
 
 
+def _wxyz_to_xyzw(quat_wxyz: np.ndarray) -> np.ndarray:
+    return np.asarray([quat_wxyz[1], quat_wxyz[2], quat_wxyz[3], quat_wxyz[0]], dtype=np.float64)
+
+
+def _quat_xyzw_to_mat(quat_xyzw: np.ndarray) -> np.ndarray:
+    x, y, z, w = quat_xyzw
+    xx = x * x
+    yy = y * y
+    zz = z * z
+    ww = w * w
+    xy = x * y
+    xz = x * z
+    yz = y * z
+    xw = x * w
+    yw = y * w
+    zw = z * w
+    return np.array(
+        [
+            [ww + xx - yy - zz, 2 * (xy - zw), 2 * (xz + yw)],
+            [2 * (xy + zw), ww - xx + yy - zz, 2 * (yz - xw)],
+            [2 * (xz - yw), 2 * (yz + xw), ww - xx - yy + zz],
+        ],
+        dtype=np.float64,
+    )
+
+
+def _mat_to_quat_xyzw(mat: np.ndarray) -> np.ndarray:
+    m = mat
+    trace = float(m[0, 0] + m[1, 1] + m[2, 2])
+    if trace > 0.0:
+        s = np.sqrt(trace + 1.0) * 2.0
+        w = 0.25 * s
+        x = (m[2, 1] - m[1, 2]) / s
+        y = (m[0, 2] - m[2, 0]) / s
+        z = (m[1, 0] - m[0, 1]) / s
+    elif m[0, 0] > m[1, 1] and m[0, 0] > m[2, 2]:
+        s = np.sqrt(1.0 + m[0, 0] - m[1, 1] - m[2, 2]) * 2.0
+        w = (m[2, 1] - m[1, 2]) / s
+        x = 0.25 * s
+        y = (m[0, 1] + m[1, 0]) / s
+        z = (m[0, 2] + m[2, 0]) / s
+    elif m[1, 1] > m[2, 2]:
+        s = np.sqrt(1.0 + m[1, 1] - m[0, 0] - m[2, 2]) * 2.0
+        w = (m[0, 2] - m[2, 0]) / s
+        x = (m[0, 1] + m[1, 0]) / s
+        y = 0.25 * s
+        z = (m[1, 2] + m[2, 1]) / s
+    else:
+        s = np.sqrt(1.0 + m[2, 2] - m[0, 0] - m[1, 1]) * 2.0
+        w = (m[1, 0] - m[0, 1]) / s
+        x = (m[0, 2] + m[2, 0]) / s
+        y = (m[1, 2] + m[2, 1]) / s
+        z = 0.25 * s
+
+    quat = np.asarray([x, y, z, w], dtype=np.float64)
+    norm = float(np.linalg.norm(quat))
+    if norm > 0:
+        quat = quat / norm
+    return quat
+
+
+def _mj_name2id(model: Any, mujoco: Any, obj_type: Any, name: str) -> int:
+    idx = int(mujoco.mj_name2id(model, obj_type, name))
+    return idx
+
+
+def _mj_id2name(model: Any, mujoco: Any, obj_type: Any, idx: int) -> str:
+    name = mujoco.mj_id2name(model, obj_type, idx)
+    return "" if name is None else str(name)
+
+
+def _joint_qpos_width_from_mj_type(mj_type: int, mujoco: Any) -> int:
+    if mj_type == int(mujoco.mjtJoint.mjJNT_FREE):
+        return 7
+    if mj_type == int(mujoco.mjtJoint.mjJNT_BALL):
+        return 4
+    return 1
+
+
+def _get_asset_search_roots() -> list[Path]:
+    global _ASSET_SEARCH_ROOTS
+    if _ASSET_SEARCH_ROOTS is not None:
+        return _ASSET_SEARCH_ROOTS
+
+    repo_root = Path(__file__).resolve().parents[2]
+    roots = [
+        repo_root,
+        repo_root / "external_dependencies",
+        repo_root / "external_dependencies" / "robocasa",
+        repo_root
+        / "gr00t"
+        / "eval"
+        / "sim"
+        / "robocasa"
+        / "robocasa_uv"
+        / ".venv"
+        / "lib"
+        / "python3.10"
+        / "site-packages",
+        Path("/home/kaveh/projects/API/RoboCasa-VR"),
+    ]
+    _ASSET_SEARCH_ROOTS = [r for r in roots if r.exists()]
+    return _ASSET_SEARCH_ROOTS
+
+
+def _collect_asset_refs(model_xml: str) -> tuple[set[str], dict[str, str]]:
+    refs: set[str] = set()
+    kind_by_ref: dict[str, str] = {}
+    try:
+        root = ET.fromstring(model_xml)
+    except Exception:
+        return refs, kind_by_ref
+
+    for tag, kind in (("mesh", "mesh"), ("texture", "texture"), ("include", "include"), ("hfield", "hfield")):
+        for elem in root.iter(tag):
+            file_attr = elem.attrib.get("file")
+            if file_attr:
+                refs.add(file_attr)
+                kind_by_ref[file_attr] = kind
+    return refs, kind_by_ref
+
+
+def _resolve_asset_path(ref: str) -> Path | None:
+    if ref in _ASSET_PATH_CACHE:
+        return _ASSET_PATH_CACHE[ref]
+
+    p = Path(ref)
+    if p.is_file():
+        resolved = p.resolve()
+        _ASSET_PATH_CACHE[ref] = resolved
+        return resolved
+
+    ref_norm = ref.replace("\\", "/")
+    parts = [part for part in ref_norm.split("/") if part not in ("", ".")]
+    roots = _get_asset_search_roots()
+
+    # Try longest-to-shortest suffix matches under known roots.
+    for root in roots:
+        for start in range(max(0, len(parts) - 8), len(parts)):
+            suffix = Path(*parts[start:])
+            candidate = root / suffix
+            if candidate.is_file():
+                resolved = candidate.resolve()
+                _ASSET_PATH_CACHE[ref] = resolved
+                return resolved
+
+    # Common package-relative fallbacks.
+    for root in roots:
+        for pkg in ("robosuite", "robocasa"):
+            for start in range(max(0, len(parts) - 8), len(parts)):
+                suffix = Path(*parts[start:])
+                candidate = root / pkg / suffix
+                if candidate.is_file():
+                    resolved = candidate.resolve()
+                    _ASSET_PATH_CACHE[ref] = resolved
+                    return resolved
+
+    # Last resort: basename search.
+    basename = Path(ref_norm).name
+    if basename:
+        for root in roots:
+            try:
+                candidate = next(root.rglob(basename))
+                if candidate.is_file():
+                    resolved = candidate.resolve()
+                    _ASSET_PATH_CACHE[ref] = resolved
+                    return resolved
+            except StopIteration:
+                pass
+            except Exception:
+                pass
+
+    _ASSET_PATH_CACHE[ref] = None
+    return None
+
+
+def _rewrite_xml_with_resolved_asset_paths(model_xml: str) -> str:
+    try:
+        root = ET.fromstring(model_xml)
+    except Exception:
+        return model_xml
+
+    # Keep only the robot subtree to avoid scene-specific asset / inertia issues.
+    robot_body = root.find(".//body[@name='robot0_base']")
+    worldbody = root.find("worldbody")
+    if robot_body is not None:
+        new_worldbody = ET.Element("worldbody")
+        new_worldbody.append(copy.deepcopy(robot_body))
+        if worldbody is not None:
+            root.remove(worldbody)
+        root.append(new_worldbody)
+        # Drop includes once robot body is inlined, otherwise extra scene bodies
+        # can be pulled back in during MuJoCo parsing.
+        for parent in list(root.iter()):
+            for child in list(parent):
+                if child.tag == "include":
+                    parent.remove(child)
+
+    # Keep only assets required by the remaining robot geoms.
+    asset = root.find("asset")
+    if asset is not None:
+        required_mesh: set[str] = set()
+        required_material: set[str] = set()
+        required_texture: set[str] = set()
+        required_hfield: set[str] = set()
+
+        for geom in root.iter("geom"):
+            mesh_name = geom.attrib.get("mesh")
+            if mesh_name:
+                required_mesh.add(mesh_name)
+            material_name = geom.attrib.get("material")
+            if material_name:
+                required_material.add(material_name)
+            hfield_name = geom.attrib.get("hfield")
+            if hfield_name:
+                required_hfield.add(hfield_name)
+            texture_name = geom.attrib.get("texture")
+            if texture_name:
+                required_texture.add(texture_name)
+
+        material_by_name: dict[str, ET.Element] = {}
+        for elem in asset:
+            if elem.tag == "material":
+                name = elem.attrib.get("name")
+                if name:
+                    material_by_name[name] = elem
+
+        changed = True
+        while changed:
+            changed = False
+            for mat_name in list(required_material):
+                mat = material_by_name.get(mat_name)
+                if mat is None:
+                    continue
+                tex_name = mat.attrib.get("texture")
+                if tex_name and tex_name not in required_texture:
+                    required_texture.add(tex_name)
+                    changed = True
+
+        for elem in list(asset):
+            tag = elem.tag
+            name = elem.attrib.get("name", "")
+            keep = True
+            if tag == "mesh":
+                keep = name in required_mesh
+            elif tag == "material":
+                keep = name in required_material
+            elif tag == "texture":
+                keep = name in required_texture
+            elif tag == "hfield":
+                keep = name in required_hfield
+            if not keep:
+                asset.remove(elem)
+
+    # Remove dynamics / constraint blocks not needed for forward kinematics replay.
+    for tag in ("actuator", "sensor", "tendon", "equality", "contact", "keyframe"):
+        for elem in list(root.findall(tag)):
+            root.remove(elem)
+
+    compiler = root.find("compiler")
+    if compiler is None:
+        compiler = ET.Element("compiler")
+        root.insert(0, compiler)
+    # Kinematics-only compile path for robust offline replay.
+    compiler.set("discardvisual", "true")
+    compiler.set("inertiafromgeom", "auto")
+
+    for tag in ("mesh", "texture", "include", "hfield"):
+        for elem in root.iter(tag):
+            file_attr = elem.attrib.get("file")
+            if not file_attr:
+                continue
+            resolved = _resolve_asset_path(file_attr)
+            if resolved is None:
+                continue
+            elem.set("file", str(resolved))
+
+    return ET.tostring(root, encoding="unicode")
+
+
+def _build_projection(model_xml: str, episode_index: int, mujoco: Any) -> EpisodeProjection:
+    try:
+        patched_xml = _rewrite_xml_with_resolved_asset_paths(model_xml)
+        model = mujoco.MjModel.from_xml_string(patched_xml)
+    except Exception as exc:
+        raise RuntimeError(f"Episode {episode_index}: failed to parse model_file XML with MuJoCo ({exc})") from exc
+
+    data = mujoco.MjData(model)
+
+    base_site_id = _mj_name2id(model, mujoco, mujoco.mjtObj.mjOBJ_SITE, "mobilebase0_center")
+    if base_site_id < 0:
+        base_candidates = [
+            i
+            for i in range(int(model.nsite))
+            if "mobilebase0" in _mj_id2name(model, mujoco, mujoco.mjtObj.mjOBJ_SITE, i)
+            and _mj_id2name(model, mujoco, mujoco.mjtObj.mjOBJ_SITE, i).endswith("center")
+        ]
+        if not base_candidates:
+            raise RuntimeError(f"Episode {episode_index}: could not find base center site in model")
+        base_site_id = int(base_candidates[0])
+
+    eef_site_id = _mj_name2id(model, mujoco, mujoco.mjtObj.mjOBJ_SITE, "gripper0_right_grip_site")
+    if eef_site_id < 0:
+        site_candidates = [
+            i
+            for i in range(int(model.nsite))
+            if "gripper0_right" in _mj_id2name(model, mujoco, mujoco.mjtObj.mjOBJ_SITE, i)
+            and "grip_site" in _mj_id2name(model, mujoco, mujoco.mjtObj.mjOBJ_SITE, i)
+        ]
+        if not site_candidates:
+            raise RuntimeError(f"Episode {episode_index}: could not find right-arm end-effector site")
+        eef_site_id = int(site_candidates[0])
+
+    eef_body_id = _mj_name2id(model, mujoco, mujoco.mjtObj.mjOBJ_BODY, "gripper0_right_eef")
+    if eef_body_id < 0:
+        body_candidates = [
+            i
+            for i in range(int(model.nbody))
+            if "gripper0_right" in _mj_id2name(model, mujoco, mujoco.mjtObj.mjOBJ_BODY, i)
+            and _mj_id2name(model, mujoco, mujoco.mjtObj.mjOBJ_BODY, i).endswith("eef")
+        ]
+        if not body_candidates:
+            raise RuntimeError(f"Episode {episode_index}: could not find right-arm end-effector body")
+        eef_body_id = int(body_candidates[0])
+
+    gripper_qpos_idx: list[int] = []
+    candidate_joint_ids: list[int] = []
+    for joint_id in range(int(model.njnt)):
+        jname = _mj_id2name(model, mujoco, mujoco.mjtObj.mjOBJ_JOINT, joint_id)
+        if jname.startswith("gripper0_right_finger_joint"):
+            candidate_joint_ids.append(joint_id)
+
+    if not candidate_joint_ids:
+        for joint_id in range(int(model.njnt)):
+            jname = _mj_id2name(model, mujoco, mujoco.mjtObj.mjOBJ_JOINT, joint_id)
+            if jname.startswith("gripper0_right"):
+                candidate_joint_ids.append(joint_id)
+
+    if not candidate_joint_ids:
+        raise RuntimeError(f"Episode {episode_index}: could not locate gripper joints in model")
+
+    candidate_joint_ids = sorted(candidate_joint_ids, key=lambda j: _mj_id2name(model, mujoco, mujoco.mjtObj.mjOBJ_JOINT, j))
+    for joint_id in candidate_joint_ids:
+        adr = int(model.jnt_qposadr[joint_id])
+        width = _joint_qpos_width_from_mj_type(int(model.jnt_type[joint_id]), mujoco)
+        gripper_qpos_idx.extend(list(range(adr, adr + width)))
+
+    if len(gripper_qpos_idx) < 2:
+        raise RuntimeError(
+            f"Episode {episode_index}: expected at least 2 gripper qpos indices, got {len(gripper_qpos_idx)}"
+        )
+
+    if len(gripper_qpos_idx) > 2:
+        gripper_qpos_idx = gripper_qpos_idx[:2]
+
+    return EpisodeProjection(
+        model=model,
+        data=data,
+        qpos_count=int(model.nq),
+        qvel_count=int(model.nv),
+        gripper_qpos_idx=gripper_qpos_idx,
+        base_site_id=int(base_site_id),
+        eef_site_id=int(eef_site_id),
+        eef_body_id=int(eef_body_id),
+    )
+
+
+def _project_actions_to_semantic(actions: np.ndarray, episode_index: int) -> np.ndarray:
+    if actions.ndim != 2:
+        raise RuntimeError(f"Episode {episode_index}: actions must be 2D, got {actions.shape}")
+    if actions.shape[1] < 12:
+        raise RuntimeError(f"Episode {episode_index}: expected action dim >= 12, got {actions.shape[1]}")
+
+    out = np.zeros((actions.shape[0], ACTION_DIM), dtype=np.float32)
+    out[:, 0:3] = actions[:, 0:3]
+    out[:, 3:6] = actions[:, 3:6]
+    out[:, 6:7] = (actions[:, 6:7] >= 0.0).astype(np.float32)
+    out[:, 7:11] = actions[:, 7:11]
+    out[:, 11:12] = (actions[:, 11:12] >= 0.0).astype(np.float32)
+    return out
+
+
+def _project_episode_to_semantic(ep: EpisodeRecord, mujoco: Any) -> EpisodeRecord:
+    if not ep.model_xml:
+        raise RuntimeError(f"Episode {ep.episode_index}: model_file missing")
+
+    proj = _build_projection(ep.model_xml, episode_index=ep.episode_index, mujoco=mujoco)
+
+    required_state_dim = 1 + proj.qpos_count + proj.qvel_count
+    if ep.states.shape[1] < required_state_dim:
+        raise RuntimeError(
+            f"Episode {ep.episode_index}: state dim too small ({ep.states.shape[1]}) for model nq/nv ({required_state_dim})"
+        )
+
+    out_states = np.zeros((ep.states.shape[0], STATE_DIM), dtype=np.float32)
+    out_actions = _project_actions_to_semantic(ep.actions, episode_index=ep.episode_index)
+
+    for t in range(ep.states.shape[0]):
+        row = ep.states[t]
+        qpos = row[1 : 1 + proj.qpos_count]
+        qvel = row[1 + proj.qpos_count : 1 + proj.qpos_count + proj.qvel_count]
+
+        proj.data.qpos[:] = qpos
+        proj.data.qvel[:] = qvel
+        if proj.data.act.shape[0] > 0:
+            proj.data.act[:] = 0.0
+        mujoco.mj_forward(proj.model, proj.data)
+
+        base_pos = np.asarray(proj.data.site_xpos[proj.base_site_id], dtype=np.float64)
+        base_mat = np.asarray(proj.data.site_xmat[proj.base_site_id], dtype=np.float64).reshape(3, 3)
+        base_quat = _mat_to_quat_xyzw(base_mat)
+
+        eef_pos = np.asarray(proj.data.site_xpos[proj.eef_site_id], dtype=np.float64)
+        eef_quat_xyzw = _wxyz_to_xyzw(np.asarray(proj.data.xquat[proj.eef_body_id], dtype=np.float64))
+        eef_mat = _quat_xyzw_to_mat(eef_quat_xyzw)
+
+        t_wa = np.eye(4, dtype=np.float64)
+        t_wa[:3, :3] = base_mat
+        t_wa[:3, 3] = base_pos
+
+        t_wb = np.eye(4, dtype=np.float64)
+        t_wb[:3, :3] = eef_mat
+        t_wb[:3, 3] = eef_pos
+
+        t_ab = np.linalg.inv(t_wa) @ t_wb
+        rel_pos = t_ab[:3, 3]
+        rel_quat = _mat_to_quat_xyzw(t_ab[:3, :3])
+        gripper_qpos = qpos[proj.gripper_qpos_idx]
+
+        out_states[t] = np.concatenate(
+            [
+                rel_pos.astype(np.float32),
+                rel_quat.astype(np.float32),
+                gripper_qpos.astype(np.float32),
+                base_pos.astype(np.float32),
+                base_quat.astype(np.float32),
+            ],
+            axis=0,
+        )
+
+    return EpisodeRecord(
+        episode_index=ep.episode_index,
+        task_text=ep.task_text,
+        env_name=ep.env_name,
+        states=out_states,
+        actions=out_actions,
+        model_xml=ep.model_xml,
+    )
+
+
+def _project_all_episodes(episodes: list[EpisodeRecord], mujoco: Any) -> tuple[list[EpisodeRecord], list[str]]:
+    converted: list[EpisodeRecord] = []
+    skipped: list[str] = []
+
+    for ep in episodes:
+        try:
+            converted.append(_project_episode_to_semantic(ep, mujoco=mujoco))
+        except Exception as exc:
+            skipped.append(f"episode={ep.episode_index}: {exc}")
+
+    return converted, skipped
+
+
+def _build_modality() -> dict[str, Any]:
+    state_modality: dict[str, Any] = {}
+    cursor = 0
+    for key, width in STATE_LAYOUT:
+        state_modality[key] = {
+            "original_key": "observation.state",
+            "start": cursor,
+            "end": cursor + width,
+        }
+        cursor += width
+
+    action_modality: dict[str, Any] = {}
+    cursor = 0
+    for key, width in ACTION_LAYOUT:
+        action_modality[key] = {
+            "original_key": "action",
+            "start": cursor,
+            "end": cursor + width,
+        }
+        cursor += width
+
+    return {
+        "state": state_modality,
+        "action": action_modality,
+        "annotation": {
+            "human.action.task_description": {
+                "original_key": "annotation.human.action.task_description",
+            },
+            "human.validity": {
+                "original_key": "annotation.human.validity",
+            },
+        },
+    }
+
+
 def convert(args: argparse.Namespace) -> None:
-    h5py, pd = _load_runtime_deps()
+    h5py, pd, mujoco = _load_runtime_deps()
 
     input_path = Path(args.input).expanduser().resolve()
     output_root = Path(args.output).expanduser().resolve()
@@ -341,47 +745,29 @@ def convert(args: argparse.Namespace) -> None:
         fallback_task=args.fallback_task,
         h5py=h5py,
     )
-    raw_episodes = _project_state_view(raw_episodes, state_view=args.state_view)
 
-    target_dims, dim_counts = _choose_target_dims(
-        raw_episodes,
-        state_dim_override=args.state_dim,
-        action_dim_override=args.action_dim,
-    )
-    state_dim, action_dim = target_dims
-
-    filtered_episodes = [
-        ep for ep in raw_episodes if (int(ep.states.shape[1]), int(ep.actions.shape[1])) == target_dims
-    ]
-    skipped = len(raw_episodes) - len(filtered_episodes)
-
-    if skipped > 0:
-        histogram = ", ".join(
-            f"({s},{a})x{c}" for (s, a), c in sorted(dim_counts.items(), key=lambda kv: (-kv[1], kv[0]))
-        )
-        print(f"Detected mixed dimensions across episodes: {histogram}")
+    if args.state_view != "semantic":
         print(
-            f"Keeping dimensions (state_dim={state_dim}, action_dim={action_dim}); "
-            f"skipped {skipped} / {len(raw_episodes)} episodes"
+            f"Warning: --state-view={args.state_view} is ignored. "
+            "This converter always exports semantic PandaOmron state for GR00T."
         )
 
-    if not filtered_episodes:
-        raise RuntimeError("No episodes remain after dimension filtering.")
+    if args.state_dim is not None or args.action_dim is not None:
+        print("Warning: --state-dim/--action-dim are ignored in semantic export mode.")
 
-    # Reindex episodes densely after filtering so chunk paths are contiguous.
-    episodes: list[EpisodeRecord] = [
-        EpisodeRecord(
-            episode_index=i,
-            task_text=ep.task_text,
-            env_name=ep.env_name,
-            states=ep.states,
-            actions=ep.actions,
-            model_xml=ep.model_xml,
-        )
-        for i, ep in enumerate(filtered_episodes)
-    ]
+    converted, skipped = _project_all_episodes(raw_episodes, mujoco=mujoco)
+    if not converted:
+        if skipped:
+            print("All episodes failed semantic projection. First errors:")
+            for msg in skipped[:20]:
+                print(f"  - {msg}")
+            if len(skipped) > 20:
+                print(f"  ... and {len(skipped) - 20} more")
+        raise RuntimeError("All episodes failed semantic projection.")
 
-    # Build task vocabulary.
+    for i, ep in enumerate(converted):
+        ep.episode_index = i
+
     valid_label = args.valid_label
     task_to_idx: dict[str, int] = {}
 
@@ -390,23 +776,26 @@ def convert(args: argparse.Namespace) -> None:
             task_to_idx[task] = len(task_to_idx)
         return task_to_idx[task]
 
-    # Register episode tasks first; add validity label after.
-    for ep in episodes:
+    for ep in converted:
         register_task(ep.task_text)
     valid_task_idx = register_task(valid_label)
 
-    # Aggregate arrays for stats.
     all_states: list[np.ndarray] = []
     all_actions: list[np.ndarray] = []
     all_timestamps: list[np.ndarray] = []
     all_rewards: list[np.ndarray] = []
+    all_task_index: list[np.ndarray] = []
+    all_episode_index: list[np.ndarray] = []
+    all_global_index: list[np.ndarray] = []
+    all_validity: list[np.ndarray] = []
+    all_next_done: list[np.ndarray] = []
     all_relative_actions: list[np.ndarray] = []
 
     episodes_meta: list[dict[str, Any]] = []
     total_frames = 0
     global_index = 0
 
-    for ep in episodes:
+    for ep in converted:
         task_idx = task_to_idx[ep.task_text]
         length = int(ep.states.shape[0])
 
@@ -422,21 +811,26 @@ def convert(args: argparse.Namespace) -> None:
         timestamps = (np.arange(length, dtype=np.float64) / float(args.fps)).reshape(-1, 1)
         rewards = np.zeros((length, 1), dtype=np.float64)
         rewards[-1, 0] = 1.0
-        next_done = np.zeros((length,), dtype=bool)
-        next_done[-1] = True
+        next_done = np.zeros((length, 1), dtype=np.float64)
+        next_done[-1, 0] = 1.0
+
+        episode_index_arr = np.full((length, 1), ep.episode_index, dtype=np.int64)
+        task_index_arr = np.full((length, 1), task_idx, dtype=np.int64)
+        validity_arr = np.full((length, 1), valid_task_idx, dtype=np.int64)
+        global_index_arr = np.arange(global_index, global_index + length, dtype=np.int64).reshape(-1, 1)
 
         frame_df = pd.DataFrame(
             {
-                "observation.state": [row for row in ep.states],
-                "action": [row for row in ep.actions],
+                "observation.state": [row.astype(np.float32) for row in ep.states],
+                "action": [row.astype(np.float32) for row in ep.actions],
                 "timestamp": timestamps[:, 0],
-                "annotation.human.action.task_description": np.full(length, task_idx, dtype=np.int64),
-                "task_index": np.full(length, task_idx, dtype=np.int64),
-                "annotation.human.validity": np.full(length, valid_task_idx, dtype=np.int64),
-                "episode_index": np.full(length, ep.episode_index, dtype=np.int64),
-                "index": np.arange(global_index, global_index + length, dtype=np.int64),
+                "annotation.human.action.task_description": task_index_arr[:, 0],
+                "task_index": task_index_arr[:, 0],
+                "annotation.human.validity": validity_arr[:, 0],
+                "episode_index": episode_index_arr[:, 0],
+                "index": global_index_arr[:, 0],
                 "next.reward": rewards[:, 0],
-                "next.done": next_done,
+                "next.done": next_done[:, 0].astype(bool),
             }
         )
         frame_df.to_parquet(parquet_path, index=False)
@@ -448,6 +842,11 @@ def convert(args: argparse.Namespace) -> None:
         all_actions.append(ep.actions)
         all_timestamps.append(timestamps)
         all_rewards.append(rewards)
+        all_task_index.append(task_index_arr.astype(np.float64))
+        all_episode_index.append(episode_index_arr.astype(np.float64))
+        all_global_index.append(global_index_arr.astype(np.float64))
+        all_validity.append(validity_arr.astype(np.float64))
+        all_next_done.append(next_done)
 
         episodes_meta.append(
             {
@@ -464,40 +863,43 @@ def convert(args: argparse.Namespace) -> None:
     actions_arr = np.concatenate(all_actions, axis=0)
     timestamps_arr = np.concatenate(all_timestamps, axis=0)
     rewards_arr = np.concatenate(all_rewards, axis=0)
+    task_index_arr = np.concatenate(all_task_index, axis=0)
+    episode_index_arr = np.concatenate(all_episode_index, axis=0)
+    global_index_arr = np.concatenate(all_global_index, axis=0)
+    validity_arr = np.concatenate(all_validity, axis=0)
+    next_done_arr = np.concatenate(all_next_done, axis=0)
 
     if all_relative_actions:
         rel_actions_arr = np.concatenate(all_relative_actions, axis=0)
     else:
-        rel_actions_arr = np.zeros((1, action_dim), dtype=np.float32)
+        rel_actions_arr = np.zeros((1, ACTION_DIM), dtype=np.float32)
 
     tasks_rows = [
         {"task_index": idx, "task": task}
         for task, idx in sorted(task_to_idx.items(), key=lambda kv: kv[1])
     ]
 
-    chunk_count = max(1, (len(episodes) + int(args.chunk_size) - 1) // int(args.chunk_size))
+    chunk_count = max(1, (len(converted) + int(args.chunk_size) - 1) // int(args.chunk_size))
     info = {
         "codebase_version": "v2.0",
         "robot_type": args.robot_type,
-        "total_episodes": len(episodes),
+        "total_episodes": len(converted),
         "total_frames": total_frames,
         "total_tasks": len(task_to_idx),
         "total_videos": 0,
-        "total_chunks": chunk_count - 1,
+        "total_chunks": chunk_count,
         "chunks_size": int(args.chunk_size),
         "fps": float(args.fps),
         "splits": {"train": "0:100"},
         "data_path": "data/chunk-{episode_chunk:03d}/episode_{episode_index:06d}.parquet",
         "features": {
             "observation.state": {
-                "dtype": "float32",
-                "shape": [state_dim],
-                "names": [f"state_{i}" for i in range(state_dim)],
+                "dtype": "object",
+                "shape": [STATE_DIM],
             },
             "action": {
-                "dtype": "float32",
-                "shape": [action_dim],
-                "names": [f"action_{i}" for i in range(action_dim)],
+                "dtype": "object",
+                "shape": [ACTION_DIM],
             },
             "timestamp": {"dtype": "float64", "shape": [1]},
             "annotation.human.action.task_description": {"dtype": "int64", "shape": [1]},
@@ -510,28 +912,23 @@ def convert(args: argparse.Namespace) -> None:
         },
     }
 
-    modality = {
-        "state": {
-            "sim_state": {"start": 0, "end": state_dim},
-        },
-        "action": {
-            "sim_action": {"start": 0, "end": action_dim},
-        },
-        "annotation": {
-            "human.action.task_description": {},
-            "human.validity": {},
-        },
-    }
+    modality = _build_modality()
 
     stats = {
         "observation.state": _compute_stats(states_arr),
         "action": _compute_stats(actions_arr),
         "timestamp": _compute_stats(timestamps_arr),
         "next.reward": _compute_stats(rewards_arr),
+        "next.done": _compute_stats(next_done_arr),
+        "task_index": _compute_stats(task_index_arr),
+        "episode_index": _compute_stats(episode_index_arr),
+        "index": _compute_stats(global_index_arr),
+        "annotation.human.action.task_description": _compute_stats(task_index_arr),
+        "annotation.human.validity": _compute_stats(validity_arr),
     }
 
     relative_stats = {
-        "sim_action": _compute_stats(rel_actions_arr),
+        "action": _compute_stats(rel_actions_arr),
     }
 
     meta_dir = output_root / "meta"
@@ -542,9 +939,15 @@ def convert(args: argparse.Namespace) -> None:
     _write_jsonl(meta_dir / "episodes.jsonl", episodes_meta)
     _write_jsonl(meta_dir / "tasks.jsonl", tasks_rows)
 
-    print(f"Converted {len(episodes)} episodes from {len(demo_files)} demo.hdf5 file(s)")
+    print(f"Converted {len(converted)} episodes from {len(demo_files)} demo.hdf5 file(s)")
     print(f"Output dataset: {output_root}")
-    print(f"state_dim={state_dim}, action_dim={action_dim}, total_frames={total_frames}")
+    print(f"state_dim={STATE_DIM}, action_dim={ACTION_DIM}, total_frames={total_frames}")
+    if skipped:
+        print(f"Skipped {len(skipped)} episodes due to projection errors.")
+        for msg in skipped[:20]:
+            print(f"  - {msg}")
+        if len(skipped) > 20:
+            print(f"  ... and {len(skipped) - 20} more")
 
 
 def build_argparser() -> argparse.ArgumentParser:
@@ -588,24 +991,21 @@ def build_argparser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--state-view",
-        choices=["full", "robot"],
-        default="full",
-        help=(
-            "State representation: 'full' keeps raw MuJoCo sim state; "
-            "'robot' keeps only time + robot/gripper/mobilebase qpos+qvel."
-        ),
+        choices=["semantic", "robot", "full"],
+        default="semantic",
+        help="Compatibility flag. This converter always exports semantic PandaOmron state.",
     )
     parser.add_argument(
         "--state-dim",
         type=int,
         default=None,
-        help="Optional: keep only episodes with this state dimension (must be used with --action-dim)",
+        help="Compatibility flag (ignored in semantic mode)",
     )
     parser.add_argument(
         "--action-dim",
         type=int,
         default=None,
-        help="Optional: keep only episodes with this action dimension (must be used with --state-dim)",
+        help="Compatibility flag (ignored in semantic mode)",
     )
     parser.add_argument(
         "--overwrite",

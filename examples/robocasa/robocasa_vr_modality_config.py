@@ -6,11 +6,23 @@ from gr00t.data.types import ModalityConfig
 robocasa_vr_config = {
     "state": ModalityConfig(
         delta_indices=[0],
-        modality_keys=["sim_state"],
+        modality_keys=[
+            "end_effector_position_relative",
+            "end_effector_rotation_relative",
+            "gripper_qpos",
+            "base_position",
+            "base_rotation",
+        ],
     ),
     "action": ModalityConfig(
         delta_indices=list(range(0, 16)),
-        modality_keys=["sim_action"],
+        modality_keys=[
+            "end_effector_position",
+            "end_effector_rotation",
+            "gripper_close",
+            "base_motion",
+            "control_mode",
+        ],
     ),
     "language": ModalityConfig(
         delta_indices=[0],
