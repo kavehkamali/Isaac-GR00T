@@ -34,6 +34,28 @@ if [[ ! -f "${MODALITY_CONFIG_PATH}" ]]; then
     exit 1
 fi
 
+if [[ -z "${PYTHON_BIN:-}" ]]; then
+    if [[ -x ".venv/bin/python" ]]; then
+        PYTHON_BIN=".venv/bin/python"
+    elif command -v python >/dev/null 2>&1; then
+        PYTHON_BIN="$(command -v python)"
+    elif command -v python3 >/dev/null 2>&1; then
+        PYTHON_BIN="$(command -v python3)"
+    else
+        echo "No python executable found. Set PYTHON_BIN manually."
+        exit 1
+    fi
+fi
+
+if [[ -z "${TORCHRUN_BIN:-}" ]]; then
+    TORCHRUN_CANDIDATE="$(dirname "${PYTHON_BIN}")/torchrun"
+    if [[ -x "${TORCHRUN_CANDIDATE}" ]]; then
+        TORCHRUN_BIN="${TORCHRUN_CANDIDATE}"
+    else
+        TORCHRUN_BIN="$(command -v torchrun || true)"
+    fi
+fi
+
 WANDB_ARGS=()
 if [[ "${USE_WANDB:-0}" == "1" ]]; then
     WANDB_ARGS+=(--use_wandb)
@@ -64,12 +86,19 @@ COMMON_ARGS=(
 )
 
 if [[ "${NUM_GPUS}" -gt 1 ]]; then
-    torchrun --nproc_per_node="${NUM_GPUS}" --master_port="${MASTER_PORT}" \
-        "${COMMON_ARGS[@]}" \
-        "${WANDB_ARGS[@]}" \
-        "${EXTRA_ARGS[@]}"
+    if [[ -n "${TORCHRUN_BIN}" ]]; then
+        "${TORCHRUN_BIN}" --nproc_per_node="${NUM_GPUS}" --master_port="${MASTER_PORT}" \
+            "${COMMON_ARGS[@]}" \
+            "${WANDB_ARGS[@]}" \
+            "${EXTRA_ARGS[@]}"
+    else
+        "${PYTHON_BIN}" -m torch.distributed.run --nproc_per_node="${NUM_GPUS}" --master_port="${MASTER_PORT}" \
+            "${COMMON_ARGS[@]}" \
+            "${WANDB_ARGS[@]}" \
+            "${EXTRA_ARGS[@]}"
+    fi
 else
-    CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0}" python \
+    CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0}" "${PYTHON_BIN}" \
         "${COMMON_ARGS[@]}" \
         "${WANDB_ARGS[@]}" \
         "${EXTRA_ARGS[@]}"

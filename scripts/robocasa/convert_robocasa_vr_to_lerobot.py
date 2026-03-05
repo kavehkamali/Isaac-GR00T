@@ -15,12 +15,16 @@ Output format:
 Notes:
 - This converter writes state-only data (no videos).
 - By default, modality keys are single blocks: "sim_state" and "sim_action".
+- If mixed state/action dimensions are present in input files, the converter
+  automatically keeps the most common (state_dim, action_dim) pair unless
+  --state-dim and --action-dim are explicitly provided.
 - Requires: h5py, pandas, pyarrow, numpy
 """
 
 from __future__ import annotations
 
 import argparse
+from collections import Counter
 from dataclasses import dataclass
 import json
 from pathlib import Path
@@ -154,6 +158,34 @@ def _read_episodes_from_hdf5(
     return episodes
 
 
+def _choose_target_dims(
+    episodes: list[EpisodeRecord],
+    state_dim_override: int | None,
+    action_dim_override: int | None,
+) -> tuple[tuple[int, int], Counter[tuple[int, int]]]:
+    dim_counts: Counter[tuple[int, int]] = Counter(
+        (int(ep.states.shape[1]), int(ep.actions.shape[1])) for ep in episodes
+    )
+
+    if (state_dim_override is None) != (action_dim_override is None):
+        raise ValueError("Use --state-dim and --action-dim together, or omit both.")
+
+    if state_dim_override is not None and action_dim_override is not None:
+        target = (int(state_dim_override), int(action_dim_override))
+        if target not in dim_counts:
+            available = ", ".join(
+                f"({s},{a})x{c}" for (s, a), c in sorted(dim_counts.items(), key=lambda kv: (-kv[1], kv[0]))
+            )
+            raise ValueError(
+                f"Requested dimensions {target} not found in input episodes. Available: {available}"
+            )
+        return target, dim_counts
+
+    # Default: pick the most common dimensions.
+    target = sorted(dim_counts.items(), key=lambda kv: (-kv[1], kv[0]))[0][0]
+    return target, dim_counts
+
+
 def _compute_stats(arr: np.ndarray) -> dict[str, list[float]]:
     if arr.ndim != 2:
         raise ValueError(f"Expected 2D array for stats, got shape={arr.shape}")
@@ -194,11 +226,48 @@ def convert(args: argparse.Namespace) -> None:
             )
         shutil.rmtree(output_root)
 
-    episodes = _read_episodes_from_hdf5(
+    raw_episodes = _read_episodes_from_hdf5(
         demo_files=demo_files,
         fallback_task=args.fallback_task,
         h5py=h5py,
     )
+
+    target_dims, dim_counts = _choose_target_dims(
+        raw_episodes,
+        state_dim_override=args.state_dim,
+        action_dim_override=args.action_dim,
+    )
+    state_dim, action_dim = target_dims
+
+    filtered_episodes = [
+        ep for ep in raw_episodes if (int(ep.states.shape[1]), int(ep.actions.shape[1])) == target_dims
+    ]
+    skipped = len(raw_episodes) - len(filtered_episodes)
+
+    if skipped > 0:
+        histogram = ", ".join(
+            f"({s},{a})x{c}" for (s, a), c in sorted(dim_counts.items(), key=lambda kv: (-kv[1], kv[0]))
+        )
+        print(f"Detected mixed dimensions across episodes: {histogram}")
+        print(
+            f"Keeping dimensions (state_dim={state_dim}, action_dim={action_dim}); "
+            f"skipped {skipped} / {len(raw_episodes)} episodes"
+        )
+
+    if not filtered_episodes:
+        raise RuntimeError("No episodes remain after dimension filtering.")
+
+    # Reindex episodes densely after filtering so chunk paths are contiguous.
+    episodes: list[EpisodeRecord] = [
+        EpisodeRecord(
+            episode_index=i,
+            task_text=ep.task_text,
+            env_name=ep.env_name,
+            states=ep.states,
+            actions=ep.actions,
+        )
+        for i, ep in enumerate(filtered_episodes)
+    ]
 
     # Build task vocabulary.
     valid_label = args.valid_label
@@ -278,16 +347,6 @@ def convert(args: argparse.Namespace) -> None:
 
         global_index += length
         total_frames += length
-
-    state_dim = int(episodes[0].states.shape[1])
-    action_dim = int(episodes[0].actions.shape[1])
-
-    # Validate consistent dimensions.
-    for ep in episodes:
-        if ep.states.shape[1] != state_dim:
-            raise ValueError("Inconsistent state dimensions across episodes.")
-        if ep.actions.shape[1] != action_dim:
-            raise ValueError("Inconsistent action dimensions across episodes.")
 
     states_arr = np.concatenate(all_states, axis=0)
     actions_arr = np.concatenate(all_actions, axis=0)
@@ -414,6 +473,18 @@ def build_argparser() -> argparse.ArgumentParser:
         "--valid-label",
         default="valid",
         help="Label text used for annotation.human.validity",
+    )
+    parser.add_argument(
+        "--state-dim",
+        type=int,
+        default=None,
+        help="Optional: keep only episodes with this state dimension (must be used with --action-dim)",
+    )
+    parser.add_argument(
+        "--action-dim",
+        type=int,
+        default=None,
+        help="Optional: keep only episodes with this action dimension (must be used with --state-dim)",
     )
     parser.add_argument(
         "--overwrite",
