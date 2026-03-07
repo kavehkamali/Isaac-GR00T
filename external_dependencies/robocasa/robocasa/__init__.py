@@ -280,6 +280,7 @@ from robocasa.environments.kitchen.single_stage.kitchen_pnp import (
 )
 from robocasa.environments.kitchen.single_stage.kitchen_minimal import (
     CountertopMugPickup,
+    CountertopPanPickup,
 )
 
 from robocasa.environments.kitchen.single_stage.kitchen_sink import (

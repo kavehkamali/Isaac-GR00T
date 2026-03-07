@@ -3,9 +3,11 @@ import numpy as np
 from robocasa.environments.kitchen.kitchen import *
 
 
-class CountertopMugPickup(Kitchen):
-    """Minimal pickup task: a single mug on a countertop in a full kitchen scene."""
+class _CountertopObjectPickup(Kitchen):
+    """Minimal pickup task: a single graspable object on a countertop."""
 
+    OBJECT_GROUP = None
+    INSTRUCTION = None
     LIFT_SUCCESS_DELTA_Z = 0.08
     LIFT_HOLD_STEPS = 5
     DEFAULT_FIXED_LAYOUT_ID = 0
@@ -16,15 +18,12 @@ class CountertopMugPickup(Kitchen):
     def __init__(self, *args, **kwargs):
         kwargs.setdefault("use_distractors", False)
         self.randomize_scene = bool(kwargs.pop("randomize_scene", False))
-        self.randomize_robot_pose = bool(kwargs.pop("randomize_robot_pose", False))
-        self.robot_pose_jitter_xy = float(max(0.0, kwargs.pop("robot_pose_jitter_xy", 0.0)))
-        self.robot_pose_outward_only = bool(kwargs.pop("robot_pose_outward_only", True))
         self.fixed_layout_id = int(kwargs.pop("fixed_layout_id", self.DEFAULT_FIXED_LAYOUT_ID))
         self.fixed_style_id = int(kwargs.pop("fixed_style_id", self.DEFAULT_FIXED_STYLE_ID))
         self.fixed_counter_name = str(kwargs.pop("fixed_counter_name", self.DEFAULT_FIXED_COUNTER_NAME))
 
         # Keep the scene deterministic unless scene randomization is explicitly enabled.
-        if not self.randomize_scene:
+        if not self.randomize_scene and "layout_and_style_ids" not in kwargs:
             kwargs["layout_ids"] = [self.fixed_layout_id]
             kwargs["style_ids"] = [self.fixed_style_id]
 
@@ -32,12 +31,16 @@ class CountertopMugPickup(Kitchen):
         self._lift_hold_count = 0
         super().__init__(*args, **kwargs)
 
+    @property
+    def counter_size(self):
+        return self.DEFAULT_COUNTER_SIZE
+
     def _setup_kitchen_references(self):
         """Select a valid countertop region and place the robot near it."""
         super()._setup_kitchen_references()
 
         if self.randomize_scene:
-            counter_kwargs = {"id": FixtureType.COUNTER, "size": self.DEFAULT_COUNTER_SIZE}
+            counter_kwargs = {"id": FixtureType.COUNTER, "size": self.counter_size}
         else:
             counter_id = (
                 self.fixed_counter_name
@@ -46,7 +49,7 @@ class CountertopMugPickup(Kitchen):
             )
             counter_kwargs = {"id": counter_id}
             if counter_id == FixtureType.COUNTER:
-                counter_kwargs["size"] = self.DEFAULT_COUNTER_SIZE
+                counter_kwargs["size"] = self.counter_size
 
         self.counter = self.register_fixture_ref("counter", counter_kwargs)
         self.init_robot_base_pos = self.counter
@@ -54,50 +57,24 @@ class CountertopMugPickup(Kitchen):
     def get_ep_meta(self):
         """Expose a fixed pickup instruction for prompt ablations."""
         ep_meta = super().get_ep_meta()
-        ep_meta["lang"] = "pick up the mug"
+        ep_meta["lang"] = self.INSTRUCTION
         return ep_meta
 
     def _get_obj_cfgs(self):
-        """Spawn exactly one graspable mug on the selected countertop."""
+        """Spawn exactly one graspable object on the selected countertop."""
         return [
             dict(
                 name="obj",
-                obj_groups="mug",
+                obj_groups=self.OBJECT_GROUP,
                 graspable=True,
                 placement=dict(
                     fixture=self.counter,
-                    size=self.DEFAULT_COUNTER_SIZE,
+                    size=self.counter_size,
                     pos=(0.0, 0.0),
                     rotation=(0.0, 0.0),
                 ),
             )
         ]
-
-    def compute_robot_base_placement_pose(self, ref_fixture, offset=None):
-        if self.randomize_robot_pose and self.robot_pose_jitter_xy > 0.0:
-            x_jitter = float(
-                self.rng.uniform(
-                    low=-self.robot_pose_jitter_xy,
-                    high=self.robot_pose_jitter_xy,
-                )
-            )
-            if self.robot_pose_outward_only:
-                # Keep y-offset outward from the counter to avoid invalid poses inside cabinetry.
-                y_jitter = float(self.rng.uniform(low=-self.robot_pose_jitter_xy, high=0.0))
-            else:
-                y_jitter = float(
-                    self.rng.uniform(
-                        low=-self.robot_pose_jitter_xy,
-                        high=self.robot_pose_jitter_xy,
-                    )
-                )
-            if offset is None:
-                offset = [0.0, 0.0]
-            else:
-                offset = list(offset)
-            offset[0] += x_jitter
-            offset[1] += y_jitter
-        return super().compute_robot_base_placement_pose(ref_fixture=ref_fixture, offset=offset)
 
     def _reset_internal(self):
         super()._reset_internal()
@@ -119,3 +96,18 @@ class CountertopMugPickup(Kitchen):
             self._lift_hold_count = 0
 
         return self._lift_hold_count >= self.LIFT_HOLD_STEPS
+
+
+class CountertopMugPickup(_CountertopObjectPickup):
+    """Minimal pickup task: a single mug on a countertop in a full kitchen scene."""
+
+    OBJECT_GROUP = "mug"
+    INSTRUCTION = "pick up the mug"
+
+
+class CountertopPanPickup(_CountertopObjectPickup):
+    """Minimal pickup task: a single pan on a countertop in a full kitchen scene."""
+
+    OBJECT_GROUP = "pan"
+    INSTRUCTION = "pick up the pan"
+    DEFAULT_COUNTER_SIZE = (0.45, 0.45)
